@@ -1,0 +1,19 @@
+[package]
+name = "experiments"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.31", features = ["derive"] }
+clap_derive = "4.5.28"
+common = { path = "../common" }
+itertools = "0.13.0"
+medians = "3.0.12"
+num-traits = "0.2.19"
+partial-aggregate-update = { path = "../partial-aggregate-update" }
+partitioned-aggregate = { path = "../partitioned-aggregate" }
+peak_alloc = "0.2.1"
+rand = "0.9.0"
+rand_distr = "0.5.1"
+rayon = "1.10.0"
+ticket = { path = "../ticket" }

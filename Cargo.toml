@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "experiments",
+    "common",
+    "ticket",
+    "partial-aggregate-update",
+    "partitioned-aggregate",
+]
