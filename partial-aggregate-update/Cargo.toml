@@ -5,13 +5,11 @@ edition = "2021"
 
 [dependencies]
 atomic-traits = "0.4.0"
-atomic_float = "1.1.0"
 common = { path = "../common" }
-fnv = "1.0.7"
 itertools = "0.13.0"
-rayon = "1.10.0"
 thread_local = "1.1.8"
-hashbrown = "0.14.5"
+bytemuck = { version = "1.23.1", features = ["zeroable_atomics"] }
+num-traits = "0.2.19"
 
 [dev-dependencies]
 fastrand = "2.1"

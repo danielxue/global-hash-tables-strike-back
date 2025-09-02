@@ -1,13 +1,55 @@
 use std::cell::{RefCell, RefMut};
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use itertools::Itertools;
 use thread_local::ThreadLocal;
 
-#[derive(Default)]
+pub struct LocalCounter<'a> {
+    copy: (usize, usize),
+    reference: RefMut<'a, (usize, usize)>,
+}
+
+impl<'a> LocalCounter<'a> {
+    fn new(reference: RefMut<'a, (usize, usize)>) -> Self {
+        Self { copy: reference.clone(), reference }
+    }
+}
+
+// Only update underlying counter on drop in order to prevent false sharing thread local variables.
+impl Drop for LocalCounter<'_> {
+    fn drop(&mut self) {
+        *self.reference = self.copy;
+    }
+}
+
+impl Deref for LocalCounter<'_> {
+    type Target = (usize, usize);
+
+    fn deref(&self) -> &Self::Target {
+        &self.copy
+    }
+}
+
+impl DerefMut for LocalCounter<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.copy
+    }
+}
+
 pub struct FuzzyCounter {
     ub: AtomicUsize,
     thread_counters: ThreadLocal<RefCell<(usize, usize)>>, // (cur value, max non-inclusive).
     step_size: usize,
+}
+
+impl Default for FuzzyCounter {
+    fn default() -> Self {
+        Self {
+            ub: AtomicUsize::new(0),
+            thread_counters: Default::default(),
+            step_size: Self::DEFAULT_STEP_SIZE,
+        }
+    }
 }
 
 impl FuzzyCounter {
@@ -21,7 +63,7 @@ impl FuzzyCounter {
         }
     }
 
-    pub fn new_with_step_size(v: usize, step_size: usize) -> Self {
+    pub fn with_step_size(v: usize, step_size: usize) -> Self {
         Self {
             ub: AtomicUsize::new(v),
             thread_counters: Default::default(),
@@ -29,14 +71,15 @@ impl FuzzyCounter {
         }
     }
 
-    pub fn get_thread_counter(&self) -> RefMut<(usize, usize)> {
-        self.thread_counters.get_or(|| {
+    pub fn get_thread_counter(&self) -> LocalCounter<'_> {
+        let reference = self.thread_counters.get_or(|| {
             let lb = self.ub.fetch_add(self.step_size, Ordering::Relaxed);
             RefCell::new((lb, lb + self.step_size))
-        }).borrow_mut()
+        }).borrow_mut();
+        LocalCounter::new(reference)
     }
 
-    pub fn fetch_increment(&self, thread_counter: &mut RefMut<(usize, usize)>) -> usize {
+    pub fn fetch_increment(&self, thread_counter: &mut LocalCounter) -> usize {
         let count = thread_counter.0;
         thread_counter.0 += 1;
         if thread_counter.0 == thread_counter.1 {
@@ -46,11 +89,11 @@ impl FuzzyCounter {
         count
     }
 
-    pub fn fetch(&self, thread_counter: &mut RefMut<(usize, usize)>) -> usize {
+    pub fn fetch(&self, thread_counter: &LocalCounter) -> usize {
         thread_counter.0
     }
 
-    pub fn increment(&self, thread_counter: &mut RefMut<(usize, usize)>) {
+    pub fn increment(&self, thread_counter: &mut LocalCounter) {
         thread_counter.0 += 1;
         if thread_counter.0 == thread_counter.1 {
             thread_counter.0 = self.ub.fetch_add(self.step_size, Ordering::Relaxed);
@@ -90,9 +133,9 @@ impl FuzzyCounterFinalizer {
         let mut read = self.ranges[0].1;
         for idx in 1..self.ranges.len() {
             while read < self.ranges[idx].0 {
+                slice.swap(write, read);
                 read += 1;
                 write += 1;
-                slice.swap(write , read);
             }
             read = self.ranges[idx].1;
         }

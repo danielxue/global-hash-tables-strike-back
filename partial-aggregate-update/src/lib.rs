@@ -2,9 +2,9 @@
 
 mod updater;
 pub mod atomic_pau;
-pub mod global_locking_agg;
-pub mod locking_agg;
-pub mod thread_local_agg;
+pub mod global_locking_pau;
+pub mod locking_pau;
+pub mod thread_local_pau;
 
 pub use updater::Updater;
 
@@ -12,16 +12,17 @@ pub use updater::Updater;
 mod tests {
     use std::thread;
     use std::sync::atomic::AtomicI32;
+    use std::sync::RwLock;
     use itertools::Itertools;
     use fastrand::Rng;
     use super::*;
 
     fn basic_count_test<A: Updater<i32, Agg=usize>>() {
         let tickets = vec![1, 2, 2, 3, 3, 3, 4, 4, 4, 4];
-        let keys = vec![2, 4, 6, 8, 9, 7, 5, 3, 1, 0];
+        let values = vec![2, 4, 6, 8, 9, 7, 5, 3, 1, 0];
 
         let agg = A::with_capacity_and_threads(8, 1);
-        agg.update_vec(&tickets, &keys);
+        agg.update_vec(&tickets, &values);
 
         let vals = agg.into_vec();
         assert_eq!(vals.len(), 8);
@@ -38,8 +39,8 @@ mod tests {
                     let mut rng = Rng::with_seed(t_id);
                     for _ in 0..10 {
                         let tickets = (0..10_000).map(|_| rng.i32(0..10_000) as usize).collect_vec();
-                        let keys = (0..10_000).map(|_| rng.i32(0..1_000_00)).collect_vec();
-                        agg_ref.update_vec(&tickets, &keys);
+                        let values = (0..10_000).map(|_| rng.i32(0..1_000_00)).collect_vec();
+                        agg_ref.update_vec(&tickets, &values);
                     }
                 });
             }
@@ -52,10 +53,10 @@ mod tests {
 
     fn basic_max_test<A: Updater<i32, Agg=i32>>() {
         let tickets = vec![1, 2, 2, 3, 3, 3, 4, 4, 4, 4];
-        let keys = vec![2, 4, 6, 8, 9, 7, 5, 3, 1, 0];
+        let values = vec![2, 4, 6, 8, 9, 7, 5, 3, 1, 0];
 
         let agg = A::with_capacity_and_threads(8, 1);
-        agg.update_vec(&tickets, &keys);
+        agg.update_vec(&tickets, &values);
 
         let vals = agg.into_vec();
         assert_eq!(vals.len(), 8);
@@ -73,9 +74,9 @@ mod tests {
                     for i in 0..10 {
                         let mut tickets = (0..10_000).collect_vec();
                         rng.shuffle(tickets.as_mut_slice());
-                        let key_min = i * 1_000_000;
-                        let keys = (0..10_000).map(|_| rng.i32(key_min..(key_min + 1_000_000))).collect_vec();
-                        agg_ref.update_vec(&tickets, &keys);
+                        let values_min = i * 1_000_000;
+                        let values = (0..10_000).map(|_| rng.i32(values_min..(values_min + 1_000_000))).collect_vec();
+                        agg_ref.update_vec(&tickets, &values);
                     }
                 });
             }
@@ -84,6 +85,84 @@ mod tests {
         let vals = agg.into_vec();
         assert_eq!(vals.len(), 10_000);
         assert!(vals.iter().all(|val| { *val >= 9_000_000 }));
+    }
+
+    fn basic_sum_test<A: Updater<i32, Agg=i32>>() {
+        let tickets = vec![1, 2, 2, 3, 3, 3, 4, 4, 4, 4];
+        let values = vec![2, 4, 6, 8, 9, 7, 5, 3, 1, 0];
+
+        let agg = A::with_capacity_and_threads(8, 1);
+        agg.update_vec(&tickets, &values);
+
+        let vals = agg.into_vec();
+        assert_eq!(vals.len(), 8);
+        assert_eq!(vals, [0, 2, 10, 24, 9, 0, 0, 0]);
+    }
+
+    fn thread_sum_test<A: Updater<i32, Agg=i32>>() {
+        let agg = A::with_capacity_and_threads(10_000, 4);
+        let sum = RwLock::new(0);
+        let sum_ref = &sum;
+
+        thread::scope(|s| {
+            let agg_ref = &agg;
+            for t_id in 0..4 {
+                s.spawn(move || {
+                    let mut rng = Rng::with_seed(t_id);
+                    for _ in 0..10 {
+                        let mut tickets = (0..10_000).collect_vec();
+                        rng.shuffle(tickets.as_mut_slice());
+                        let values = (0..10_000).map(|_| rng.i32(0..100)).collect_vec();
+                        agg_ref.update_vec(&tickets, &values);
+                        let mut sum = sum_ref.write().unwrap();
+                        *sum += values.iter().sum::<i32>();
+                    }
+                });
+            }
+        });
+
+        let vals = agg.into_vec();
+        assert_eq!(vals.len(), 10_000);
+        assert_eq!(vals.iter().sum::<i32>(), sum.into_inner().unwrap());
+    }
+
+    fn basic_avg_test<A: Updater<i32, Agg=f32>>() {
+        let tickets = vec![1, 2, 2, 3, 3, 3, 4, 4, 4, 4];
+        let values = vec![2, 4, 6, 8, 9, 7, 5, 3, 1, 0];
+
+        let agg = A::with_capacity_and_threads(8, 1);
+        agg.update_vec(&tickets, &values);
+
+        let vals = agg.into_vec();
+        assert_eq!(vals.len(), 8);
+        assert_eq!(vals, [0f32, 2f32, 5f32, 8f32, 2.25f32, 0f32, 0f32, 0f32]);
+    }
+
+    fn thread_avg_test<A: Updater<i32, Agg=f32>>() {
+        let agg = A::with_capacity_and_threads(10_000, 4);
+        let sum = RwLock::new(0);
+        let sum_ref = &sum;
+
+        thread::scope(|s| {
+            let agg_ref = &agg;
+            for t_id in 0..4 {
+                s.spawn(move || {
+                    let mut rng = Rng::with_seed(t_id);
+                    for _ in 0..10 {
+                        let mut tickets = (0..10_000).collect_vec();
+                        rng.shuffle(tickets.as_mut_slice());
+                        let values = (0..10_000).map(|_| rng.i32(0..100)).collect_vec();
+                        agg_ref.update_vec(&tickets, &values);
+                        let mut sum = sum_ref.write().unwrap();
+                        *sum += values.iter().sum::<i32>();
+                    }
+                });
+            }
+        });
+
+        let vals = agg.into_vec();
+        assert_eq!(vals.len(), 10_000);
+        // TODO: test for correctness.
     }
 
     // Atomic.
@@ -107,46 +186,116 @@ mod tests {
         thread_max_test::<atomic_pau::MaxUpdater<AtomicI32>>();
     }
 
+    #[test]
+    fn basic_sum_test_atomic() {
+        basic_sum_test::<atomic_pau::SumUpdater<AtomicI32>>();
+    }
+
+    #[test]
+    fn thread_sum_test_atomic() {
+        thread_sum_test::<atomic_pau::SumUpdater<AtomicI32>>();
+    }
+
+    #[test]
+    fn basic_avg_test_atomic() {
+        basic_avg_test::<atomic_pau::AvgUpdater<i32>>();
+    }
+
+    #[test]
+    fn thread_avg_test_atomic() {
+        thread_avg_test::<atomic_pau::AvgUpdater<i32>>();
+    }
+
     // Locking.
     #[test]
     fn basic_count_test_locking() {
-        basic_count_test::<locking_agg::CountUpdater<i32>>();
+        basic_count_test::<locking_pau::CountUpdater<i32>>();
     }
 
     #[test]
     fn thread_count_test_locking() {
-        thread_count_test::<locking_agg::CountUpdater<i32>>();
+        thread_count_test::<locking_pau::CountUpdater<i32>>();
     }
 
     #[test]
     fn basic_max_test_locking() {
-        basic_max_test::<locking_agg::MaxUpdater<i32>>();
+        basic_max_test::<locking_pau::MaxUpdater<i32>>();
     }
 
     #[test]
     fn thread_max_test_locking() {
-        thread_max_test::<locking_agg::MaxUpdater<i32>>();
+        thread_max_test::<locking_pau::MaxUpdater<i32>>();
+    }
+
+    #[test]
+    fn basic_sum_test_locking() {
+        basic_sum_test::<locking_pau::SumUpdater<i32>>();
+    }
+
+    #[test]
+    fn thread_sum_test_locking() {
+        thread_sum_test::<locking_pau::SumUpdater<i32>>();
     }
 
     // Global locking.
     #[test]
     fn basic_count_test_global_locking() {
-        basic_count_test::<global_locking_agg::CountUpdater<i32>>();
+        basic_count_test::<global_locking_pau::CountUpdater<i32>>();
     }
 
     #[test]
     fn thread_count_test_global_locking() {
-        thread_count_test::<global_locking_agg::CountUpdater<i32>>();
+        thread_count_test::<global_locking_pau::CountUpdater<i32>>();
+    }
+
+    #[test]
+    fn basic_max_test_global_locking() {
+        basic_max_test::<global_locking_pau::MaxUpdater<i32>>();
+    }
+
+    #[test]
+    fn thread_max_test_global_locking() {
+        thread_max_test::<global_locking_pau::MaxUpdater<i32>>();
+    }
+
+    #[test]
+    fn basic_sum_test_global_locking() {
+        basic_sum_test::<global_locking_pau::SumUpdater<i32>>();
+    }
+
+    #[test]
+    fn thread_sum_test_global_locking() {
+        thread_sum_test::<global_locking_pau::SumUpdater<i32>>();
     }
 
     // Thread local.
     #[test]
     fn basic_count_test_thread_local() {
-        basic_count_test::<thread_local_agg::CountUpdater<i32>>();
+        basic_count_test::<thread_local_pau::CountUpdater<i32>>();
     }
 
     #[test]
     fn thread_count_test_thread_local() {
-        thread_count_test::<thread_local_agg::CountUpdater<i32>>();
+        thread_count_test::<thread_local_pau::CountUpdater<i32>>();
+    }
+
+    #[test]
+    fn basic_max_test_thread_local() {
+        basic_max_test::<thread_local_pau::MaxUpdater<i32>>();
+    }
+
+    #[test]
+    fn thread_max_test_thread_local() {
+        thread_max_test::<thread_local_pau::MaxUpdater<i32>>();
+    }
+
+    #[test]
+    fn basic_sum_test_thread_local() {
+        basic_sum_test::<thread_local_pau::SumUpdater<i32>>();
+    }
+
+    #[test]
+    fn thread_sum_test_thread_local() {
+        thread_sum_test::<thread_local_pau::SumUpdater<i32>>();
     }
 }

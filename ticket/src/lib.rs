@@ -26,8 +26,10 @@ pub use ticketer::{KeyedTicketer, Ticketer};
 mod tests {
     use std::{sync::atomic::AtomicI32, thread};
 
-    use fastrand::Rng;
     use itertools::Itertools;
+    use rand::prelude::SliceRandom;
+    use rand::rngs::SmallRng;
+    use rand::SeedableRng;
     use common::FuzzyCounter;
     use super::*;
 
@@ -67,69 +69,98 @@ mod tests {
     }
 
     fn thread_test<T: Ticketer<i32>>() {
-        let hm = T::with_capacity_and_threads(1000, 4);
+        const KEYS: usize = 10_000;
+        const THREADS: usize = 4;
+        const CHUNKS: usize = 10;
+        const CHUNK_SIZE: usize = 100_000;
+
+        let hm = T::with_capacity_and_threads(KEYS, 4);
         thread::scope(|s| {
             let hm_ref = &hm;
-            for t_id in 0..4 {
+            for t_id in 0..THREADS {
                 s.spawn(move || {
-                    let mut rng = Rng::with_seed(t_id);
-                    let mut out = vec![0; 10_000];
-                    for _ in 0..10 {
-                        let keys = (0..10_000).map(|_| rng.i32(0..1000)).collect_vec();
-                        hm_ref.ticket(&keys, &mut out);
-                    }
+                    let mut rng = SmallRng::from_seed([t_id as u8; 32]);
+                    let mut out = vec![0; CHUNK_SIZE];
+                    let mut keys = (0..((CHUNKS * CHUNK_SIZE) as i32))
+                        .map(|k| k % (KEYS as i32))
+                        .collect_vec();
+                    keys.shuffle(&mut rng);
+                    keys.chunks(CHUNK_SIZE)
+                        .for_each(|chunk| {
+                            hm_ref.ticket(&chunk, &mut out);
+                        })
                 });
             }
         });
 
         let kvs = hm.into_kvs();
-        assert!(kvs.iter().all(|(k, _v)| { *k < 1000 }));
-        assert!(kvs.iter().all(|(_k, v)| { *v < 1000 + FuzzyCounter::DEFAULT_STEP_SIZE * 4 }));
-        assert_eq!(kvs.iter().sorted().dedup().count(), 1000);
+        assert!(kvs.iter().all(|(k, _v)| { *k < KEYS as i32 }));
+        assert!(kvs.iter().all(|(_k, v)| { *v < KEYS + FuzzyCounter::DEFAULT_STEP_SIZE * THREADS }));
+        assert_eq!(kvs.iter().map(|kv| kv.0).sorted().dedup().count(), KEYS);
+        assert_eq!(kvs.iter().map(|kv| kv.1).sorted().dedup().count(), KEYS);
     }
 
     fn grow_thread_test<T: Ticketer<i32>>() {
-        let hm = T::with_capacity_and_threads(8, 4);
+        const KEYS: usize = 10_000;
+        const THREADS: usize = 4;
+        const CHUNKS: usize = 10;
+        const CHUNK_SIZE: usize = 100_000;
+
+        let hm = T::with_capacity_and_threads(100, 4);
         thread::scope(|s| {
             let hm_ref = &hm;
-            for t_id in 0..4 {
+            for t_id in 0..THREADS {
                 s.spawn(move || {
-                    let mut rng = Rng::with_seed(t_id);
-                    let mut out = vec![0; 100];
-                    for _ in 0..1000 {
-                        let keys = (0..100).map(|_| rng.i32(0..1000)).collect_vec();
-                        hm_ref.ticket(&keys, &mut out);
-                    }
+                    let mut rng = SmallRng::from_seed([t_id as u8; 32]);
+                    let mut out = vec![0; CHUNK_SIZE];
+                    let mut keys = (0..((CHUNKS * CHUNK_SIZE) as i32))
+                        .map(|k| k % (KEYS as i32))
+                        .collect_vec();
+                    keys.shuffle(&mut rng);
+                    keys.chunks(CHUNK_SIZE)
+                        .for_each(|chunk| {
+                            hm_ref.ticket(&chunk, &mut out);
+                        })
                 });
             }
         });
 
         let kvs = hm.into_kvs();
-        assert!(kvs.iter().all(|(k, _v)| { *k < 1000 }));
-        assert!(kvs.iter().all(|(_k, v)| { *v < 1000 + FuzzyCounter::DEFAULT_STEP_SIZE * 4 }));
-        assert_eq!(kvs.iter().sorted().dedup().count(), 1000);
+        assert!(kvs.iter().all(|(k, _v)| { *k < KEYS as i32 }));
+        assert!(kvs.iter().all(|(_k, v)| { *v < KEYS + FuzzyCounter::DEFAULT_STEP_SIZE * THREADS }));
+        assert_eq!(kvs.iter().map(|kv| kv.0).sorted().dedup().count(), KEYS);
+        assert_eq!(kvs.iter().map(|kv| kv.1).sorted().dedup().count(), KEYS);
     }
 
     fn keyed_test<T: KeyedTicketer<i32>>() {
-        let hm = T::with_capacity_and_threads(1000, 4);
+        const KEYS: usize = 10_000;
+        const THREADS: usize = 4;
+        const CHUNKS: usize = 10;
+        const CHUNK_SIZE: usize = 100_000;
+
+        let hm = T::with_capacity_and_threads(KEYS, 4);
         thread::scope(|s| {
             let hm_ref = &hm;
-            for t_id in 0..4 {
+            for t_id in 0..THREADS {
                 s.spawn(move || {
-                    let mut rng = Rng::with_seed(t_id);
-                    let mut out = vec![0; 10_000];
-                    for _ in 0..10 {
-                        let keys = (0..10_000).map(|_| rng.i32(0..1000)).collect_vec();
-                        hm_ref.ticket(&keys, &mut out);
-                    }
+                    let mut rng = SmallRng::from_seed([t_id as u8; 32]);
+                    let mut out = vec![0; CHUNK_SIZE];
+                    let mut keys = (0..((CHUNKS * CHUNK_SIZE) as i32))
+                        .map(|k| k % (KEYS as i32))
+                        .collect_vec();
+                    keys.shuffle(&mut rng);
+                    keys.chunks(CHUNK_SIZE)
+                        .for_each(|chunk| {
+                            hm_ref.ticket(&chunk, &mut out);
+                        })
                 });
             }
         });
 
         let (keys, _finalizer) = hm.into_keys();
-        assert!(keys.iter().all(|k| { *k < 1000 }));
-        assert_eq!(keys.len(), 1000);
-        assert_eq!(keys.iter().sorted().dedup().count(), 1000);
+        assert!(keys.iter().all(|k| { *k < KEYS as i32 }));
+        assert_eq!(keys.len(), KEYS);
+        assert_eq!(keys.iter().sorted().dedup().count(), KEYS);
     }
 
     // Cuckoo. Resizing not supported yet.

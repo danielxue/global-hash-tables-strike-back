@@ -3,28 +3,22 @@
 script_dir=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 . ${script_dir}/run_workload.sh
 
-output_file=${script_dir}/../data/fuzzy_ticketing_experiment.csv
+output_file=${script_dir}/../data/zeroed_experiment.csv
 echo_columns $output_file
 
 for thread in "$@"; do
-        ## Low cardinality (1000 / 100 million elements), ~100% lookup/~0% insertion.
-    # Fuzzy.
+    ## Low cardinality (1000 / 100 million elements), ~100% lookup/~0% insertion.
+    # Uniform data distribution.
     bench $output_file -w folklore-map -t $thread -k 1000 -e 100000000
-
-    # Atomic.
-    bench $output_file -w folklore-unfuzzy-map -t $thread -k 1000 -e 100000000
+    bench $output_file -w folklore-map -t $thread -k 1000 -e 100000000 --no-zero
 
     ## High cardinality (10 million keys / 100 million elements), 90% lookup/10% insertion.
-    # Fuzzy.
+    # Uniform data distribution.
     bench $output_file -w folklore-map -t $thread -k 10000000 -e 100000000
-
-    # Atomic.
-    bench $output_file -w folklore-unfuzzy-map -t $thread -k 10000000 -e 100000000
+    bench $output_file -w folklore-map -t $thread -k 10000000 -e 100000000 --no-zero
 
     ## Unique keys (100 million keys / 100 million elements), 0% lookup/100% insertion.
-    # Fuzzy.
+    # Uniform data distribution.
     bench $output_file -w folklore-map -t $thread -k 100000000 -e 100000000
-
-    # Atomic.
-    bench $output_file -w folklore-unfuzzy-map -t $thread -k 100000000 -e 100000000
+    bench $output_file -w folklore-map -t $thread -k 100000000 -e 100000000 --no-zero
 done

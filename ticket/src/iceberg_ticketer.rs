@@ -1,44 +1,47 @@
-use std::{collections::HashMap, hash::{BuildHasher, Hash, Hasher}, simd::{prelude::SimdPartialEq, Simd, SimdElement, Mask, MaskElement}};
-use std::cell::RefMut;
-use std::simd::{LaneCount, SupportedLaneCount};
+use std::collections::HashMap;
+use std::hash::{BuildHasher, Hash, Hasher};
+use std::simd::{LaneCount, Mask, MaskElement, Simd, SimdElement, SupportedLaneCount};
+use std::simd::prelude::SimdPartialEq;
 use std::simd::num::SimdInt;
 use std::sync::{Mutex, RwLock, RwLockReadGuard};
 
-use common::{FuzzyCounter, SyncUnsafeCell};
+use bytemuck::{zeroed_vec, Zeroable};
 use fnv::FnvBuildHasher;
 use itertools::Itertools;
 
 use crate::ticketer::Ticketer;
+use common::{FuzzyCounter, LocalCounter, SyncUnsafeCell};
 
 const LV1_BUCKET_SIZE: usize = 32;
 const LV2_BUCKET_SIZE: usize = 8;
 
-struct IcebergBucket<K: Default, const BUCKET_SIZE: usize> {
+#[derive(Zeroable)]
+struct IcebergBucket<K: Zeroable + Default, const BUCKET_SIZE: usize> {
     metadata: [SyncUnsafeCell<u8>; BUCKET_SIZE],
     keys: [SyncUnsafeCell<K>; BUCKET_SIZE],
     tickets: [SyncUnsafeCell<usize>; BUCKET_SIZE],
-    mutex: Mutex<()>,
 }
 
-impl<K: Default, const BUCKET_SIZE: usize> IcebergBucket<K, BUCKET_SIZE> {
+impl<K: Default + Zeroable, const BUCKET_SIZE: usize>  Default for IcebergBucket<K, BUCKET_SIZE> {
     fn default() -> Self {
         Self {
             metadata: core::array::from_fn(|_| Default::default()),
             keys: core::array::from_fn(|_| Default::default()),
             tickets: core::array::from_fn(|_| Default::default()),
-            mutex: Default::default(),
         }
     }
 }
 
-pub struct IcebergTicketer<K: Default, S = FnvBuildHasher>
+pub struct IcebergTicketer<K: Zeroable + Default, S = FnvBuildHasher>
 where
     S: BuildHasher + Send + Default,
 {
     lv1_table: RwLock<Vec<IcebergBucket<K, LV1_BUCKET_SIZE>>>,
+    lv1_mutexes: Vec<Mutex<()>>,
     // This is slightly non-canonical because second level uses mutexes instead of atomics due to
     // issues with implementation in Rust, but not reached enough to make a big a difference for benchmark.
     lv2_table: RwLock<Vec<IcebergBucket<K, LV2_BUCKET_SIZE>>>,
+    lv2_mutexes: Vec<Mutex<()>>,
     // Resizing has not been implemented, so overflow is used in place.
     overflow: RwLock<HashMap<K, usize, S>>,
     ticketer: FuzzyCounter,
@@ -51,7 +54,7 @@ enum LookupResult {
     Insert,
 }
 
-impl<K: Eq + Clone + Default, S: BuildHasher + Send + Sync + Default> IcebergTicketer<K, S> {
+impl<K: Eq + Clone + Zeroable + Default, S: BuildHasher + Send + Sync + Default> IcebergTicketer<K, S> {
     const LF: f64 = 0.85;
 
     unsafe fn lookup<const BUCKET_SIZE: usize>(
@@ -69,8 +72,8 @@ impl<K: Eq + Clone + Default, S: BuildHasher + Send + Sync + Default> IcebergTic
             .simd_eq(fps.clone())
             .first_set()
             .unwrap_or(BUCKET_SIZE);
-        if first_match < BUCKET_SIZE && &*bucket.keys[first_match].value.get() == key {
-            return LookupResult::Some(*bucket.tickets[first_match].value.get());
+        if first_match < BUCKET_SIZE && &*bucket.keys[first_match].get() == key {
+            return LookupResult::Some(*bucket.tickets[first_match].get());
         } else if first_match == BUCKET_SIZE {
             let first_empty = Simd::<u8, BUCKET_SIZE>::splat(0)
                 .simd_eq(fps)
@@ -89,7 +92,7 @@ impl<K: Eq + Clone + Default, S: BuildHasher + Send + Sync + Default> IcebergTic
         key: &K,
         hash: usize,
         bucket: &IcebergBucket<K, BUCKET_SIZE>,
-        counter: &mut RefMut<(usize, usize)>,
+        counter: &mut LocalCounter,
     ) -> Option<usize>
     where LaneCount<BUCKET_SIZE>: SupportedLaneCount
     {
@@ -100,8 +103,8 @@ impl<K: Eq + Clone + Default, S: BuildHasher + Send + Sync + Default> IcebergTic
             .simd_eq(fps)
             .first_set()
             .unwrap_or(BUCKET_SIZE);
-        if first_match < BUCKET_SIZE && &*bucket.keys[first_match].value.get() == key {
-            return Some(*bucket.tickets[first_match].value.get());
+        if first_match < BUCKET_SIZE && &*bucket.keys[first_match].get() == key {
+            return Some(*bucket.tickets[first_match].get());
         } else if first_match == BUCKET_SIZE {
             let first_empty = Simd::<u8, BUCKET_SIZE>::splat(0)
                 .simd_eq(fps.clone())
@@ -109,9 +112,9 @@ impl<K: Eq + Clone + Default, S: BuildHasher + Send + Sync + Default> IcebergTic
                 .unwrap_or(BUCKET_SIZE);
             if first_empty < BUCKET_SIZE {
                 let ticket = self.ticketer.fetch_increment(counter);
-                *bucket.keys[first_empty].value.get() = key.clone();
-                *bucket.tickets[first_empty].value.get() = ticket;
-                *bucket.metadata[first_empty].value.get() = fp;
+                *bucket.keys[first_empty].get() = key.clone();
+                *bucket.tickets[first_empty].get() = ticket;
+                *bucket.metadata[first_empty].get() = fp;
                 return Some(ticket);
             }
         }
@@ -124,9 +127,10 @@ impl<K: Eq + Clone + Default, S: BuildHasher + Send + Sync + Default> IcebergTic
         key: &K,
         hash: usize,
         bucket: &IcebergBucket<K, LV1_BUCKET_SIZE>,
-        counter: &mut RefMut<(usize, usize)>,
+        mutex: &Mutex<()>,
+        counter: &mut LocalCounter,
     ) -> Option<usize> {
-        let _mutex = bucket.mutex.lock();
+        let _mutex = mutex.lock();
         self.insert::<LV1_BUCKET_SIZE>(key, hash, bucket, counter)
     }
 
@@ -135,24 +139,26 @@ impl<K: Eq + Clone + Default, S: BuildHasher + Send + Sync + Default> IcebergTic
         key: &K,
         hashes: (usize, usize),
         table: &RwLockReadGuard<Vec<IcebergBucket<K, LV2_BUCKET_SIZE>>>,
-        counter: &mut RefMut<(usize, usize)>,
+        counter: &mut LocalCounter,
     ) -> Option<usize> {
         let idxs = ((hashes.0 >> 8) % table.len(), (hashes.1 >> 8) % table.len());
         if idxs.0 == idxs.1 {
             let bucket = &table[idxs.0];
-            let _lock = bucket.mutex.lock();
+            let _lock = self.lv2_mutexes[idxs.0].lock();
             return self.insert::<LV2_BUCKET_SIZE>(key, hashes.0, bucket, counter);
         }
 
         let mut hashes = hashes;
         let mut buckets = (&table[idxs.0], &table[idxs.1]);
+        let mut mutexes = (&self.lv2_mutexes[idxs.0], &self.lv2_mutexes[idxs.1]);
         if idxs.1 < idxs.0 {
             std::mem::swap(&mut hashes.0, &mut hashes.1);
             std::mem::swap(&mut buckets.0, &mut buckets.1);
+            std::mem::swap(&mut mutexes.0, &mut mutexes.1);
         }
 
-        let _mutex0 = buckets.0.mutex.lock();
-        let _mutex1 = buckets.1.mutex.lock();
+        let _mutex0 = mutexes.0.lock();
+        let _mutex1 = mutexes.1.lock();
 
         let metadata0 = std::mem::transmute::<&[SyncUnsafeCell<u8>; LV2_BUCKET_SIZE], &[u8; LV2_BUCKET_SIZE]>(&buckets.0.metadata);
         let metadata1 = std::mem::transmute::<&[SyncUnsafeCell<u8>; LV2_BUCKET_SIZE], &[u8; LV2_BUCKET_SIZE]>(&buckets.1.metadata);
@@ -186,24 +192,39 @@ impl<K: Eq + Clone + Default, S: BuildHasher + Send + Sync + Default> IcebergTic
 }
 
 impl<
-    K: Eq + Hash + Default + Copy + Sync + Send + SimdElement + MaskElement + PartialEq,
+    K: Eq + Hash + Default + Copy + Sync + Send + Zeroable + SimdElement + MaskElement + PartialEq,
     S: BuildHasher + Send + Sync + Default
 > Ticketer<K> for IcebergTicketer<K, S>
 where
     Simd<K, LV1_BUCKET_SIZE>: SimdPartialEq<Mask=Mask<K, LV1_BUCKET_SIZE>>,
 {
     fn with_capacity_and_threads(capacity: usize, _threads: usize) -> Self {
-        let lv1_table = (0..((capacity.div_ceil(LV1_BUCKET_SIZE) as f64 / Self::LF).ceil() as usize))
-            .map(|_| IcebergBucket::default())
-            .collect_vec();
-        // Use LV1_BUCKET_SIZE for capacity calculation again to maintain same length array, but with smaller bukcets. A bit arbitrary though.
-        let lv2_table = (0..((capacity.div_ceil(LV1_BUCKET_SIZE) as f64 / Self::LF).ceil() as usize))
-            .map(|_| IcebergBucket::default())
-            .collect_vec();
+        let lv1_size = (capacity.div_ceil(LV1_BUCKET_SIZE) as f64 / Self::LF).ceil() as usize;
+        let lv2_size = (capacity.div_ceil(LV1_BUCKET_SIZE) as f64 / Self::LF).ceil() as usize;
+
+        let lv1_table = (0..lv1_size).map(|_| Default::default()).collect_vec();
+        let lv2_table = (0..lv2_size).map(|_| Default::default()).collect_vec();
 
         IcebergTicketer {
             lv1_table: RwLock::new(lv1_table),
+            lv1_mutexes: (0..lv1_size).map(|_| Default::default()).collect_vec(),
             lv2_table: RwLock::new(lv2_table),
+            lv2_mutexes: (0..lv2_size).map(|_| Default::default()).collect_vec(),
+            overflow: Default::default(),
+            ticketer: Default::default(),
+            bh: Default::default(),
+        }
+    }
+
+    fn with_capacity_and_threads_zeroed(capacity: usize, _threads: usize) -> Self {
+        let lv1_size = (capacity.div_ceil(LV1_BUCKET_SIZE) as f64 / Self::LF).ceil() as usize;
+        let lv2_size = (capacity.div_ceil(LV1_BUCKET_SIZE) as f64 / Self::LF).ceil() as usize;
+
+        IcebergTicketer {
+            lv1_table: RwLock::new(zeroed_vec(lv1_size)),
+            lv1_mutexes: (0..lv1_size).map(|_| Default::default()).collect_vec(),
+            lv2_table: RwLock::new(zeroed_vec(lv2_size)),
+            lv2_mutexes: (0..lv2_size).map(|_| Default::default()).collect_vec(),
             overflow: Default::default(),
             ticketer: Default::default(),
             bh: Default::default(),
@@ -224,7 +245,9 @@ where
         let lv2_table = self.lv2_table.read().unwrap();
         'outer: for idx in 0..keys.len() {
             let hash = output[idx];
-            let lv1_bucket = &lv1_table[(hash >> 8) % lv1_table.len()];
+            let bucket_idx = (hash >> 8) % lv1_table.len();
+            let lv1_bucket = &lv1_table[bucket_idx];
+            let lv1_mutex = &self.lv1_mutexes[bucket_idx];
 
             // Fast path lockless lookup.
             'lookup: {
@@ -282,7 +305,7 @@ where
 
             // Full insert/lookup.
             unsafe {
-                match self.insert_lv1(&keys[idx], hash, lv1_bucket, &mut counter) {
+                match self.insert_lv1(&keys[idx], hash, lv1_bucket, &lv1_mutex, &mut counter) {
                     Some(ticket) => {
                         output[idx] = ticket;
                     },
@@ -327,17 +350,17 @@ where
             .flat_map(|bucket| {
                 let metadata = bucket.metadata
                     .into_iter()
-                    .map(|cell| cell.value.into_inner())
+                    .map(|cell| cell.into_inner())
                     .collect_vec();
                 bucket.keys
                     .into_iter()
                     .zip(bucket.tickets.into_iter())
                     .enumerate()
                     .filter_map(move |(idx, kv)| {
-                        if metadata[idx] > 0 {
-                            return Some((kv.0.value.into_inner(), kv.1.value.into_inner()))
+                        return if metadata[idx] > 0 {
+                            Some((kv.0.into_inner(), kv.1.into_inner()))
                         } else {
-                            return None
+                            None
                         }
                     })
             })
@@ -348,17 +371,17 @@ where
                 .flat_map(|bucket| {
                     let metadata = bucket.metadata
                         .into_iter()
-                        .map(|cell| cell.value.into_inner())
+                        .map(|cell| cell.into_inner())
                         .collect_vec();
                     bucket.keys
                         .into_iter()
                         .zip(bucket.tickets.into_iter())
                         .enumerate()
                         .filter_map(move |(idx, kv)| {
-                            if metadata[idx] > 0 {
-                                return Some((kv.0.value.into_inner(), kv.1.value.into_inner()))
+                            return if metadata[idx] > 0 {
+                                Some((kv.0.into_inner(), kv.1.into_inner()))
                             } else {
-                                return None
+                                None
                             }
                         })
                 })

@@ -1,9 +1,12 @@
-use std::cell::UnsafeCell;
+#![allow(dead_code)] // For some weird linting with Zeroable derive.
 
-#[derive(Default)]
+use std::cell::UnsafeCell;
+use bytemuck::Zeroable;
+
+#[derive(Default, Zeroable)]
 #[repr(transparent)]
 pub struct SyncUnsafeCell<T: ?Sized> {
-    pub value: UnsafeCell<T>,
+    value: UnsafeCell<T>,
 }
 
 impl<T> SyncUnsafeCell<T> {
@@ -12,6 +15,8 @@ impl<T> SyncUnsafeCell<T> {
     }
 
     pub fn get(&self) -> *mut T { self.value.get() }
+
+    pub fn into_inner(self) -> T { self.value.into_inner() }
 }
 
 unsafe impl<T: ?Sized> Send for SyncUnsafeCell<T> {}

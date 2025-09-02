@@ -1,13 +1,11 @@
-use std::{
-    cell::RefMut,
-    hash::{Hash, Hasher},
-    sync::{RwLock, OnceLock},
-};
-use std::hash::BuildHasher;
+use std::hash::{BuildHasher, Hash, Hasher};
+use std::sync::{RwLock, OnceLock};
+
 use fnv::FnvBuildHasher;
 use itertools::Itertools;
-use common::FuzzyCounter;
+
 use crate::ticketer::Ticketer;
+use common::{FuzzyCounter, LocalCounter};
 
 pub struct OnceLockHashMap<K, S = FnvBuildHasher> {
     table: RwLock<Vec<OnceLock<(K, usize)>>>,
@@ -28,17 +26,17 @@ where
         table: &[OnceLock<(K, usize)>],
         table_pos: usize,
         key: &K,
-        counter: &mut RefMut<(usize, usize)>,
+        counter: &mut LocalCounter,
     ) -> Option<usize> {
         loop {
             let (curr_key, curr_ticket) = &table[table_pos].get_or_init(
                 || (key.clone(), self.ticketer.fetch_increment(counter))
             );
 
-            if curr_key == key {
-                return Some(*curr_ticket);
+            return if curr_key == key {
+                Some(*curr_ticket)
             } else {
-                return None;
+                None
             }
         }
     }
@@ -98,6 +96,19 @@ where
     K: Hash + Eq + Clone + Send + Sync + Default,
     S: BuildHasher + Send + Sync + Default,
 {
+    fn with_capacity_and_threads(capacity: usize, threads: usize) -> Self {
+        let table = (0..((capacity as f64 / Self::LF).ceil() as usize))
+            .map(|_| OnceLock::<(K, usize)>::new())
+            .collect_vec();
+
+        OnceLockHashMap {
+            table: RwLock::new(table),
+            ticketer: Default::default(),
+            threads,
+            bh: Default::default(),
+        }
+    }
+
     fn ticket(&self, keys: &[K], output: &mut [usize]) {
         let mut counter = self.ticketer.get_thread_counter();
 
@@ -130,7 +141,7 @@ where
 
                 if table_pos == hash_mod {
                     let table_len = table.len();
-                    std::mem::drop(table);
+                    drop(table);
                     self.resize(table_len);
                     table = self.table.read().unwrap();
 
@@ -159,18 +170,5 @@ where
             .into_iter()
             .filter_map(|kv| kv.into_inner())
             .collect_vec()
-    }
-
-    fn with_capacity_and_threads(capacity: usize, threads: usize) -> Self {
-        let table = (0..((capacity as f64 / Self::LF).ceil() as usize))
-            .map(|_| OnceLock::<(K, usize)>::new())
-            .collect_vec();
-
-        OnceLockHashMap {
-            table: RwLock::new(table),
-            ticketer: Default::default(),
-            threads,
-            bh: Default::default(),
-        }
     }
 }

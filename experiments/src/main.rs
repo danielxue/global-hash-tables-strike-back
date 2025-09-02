@@ -1,10 +1,14 @@
+use std::ops::AddAssign;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicI16, AtomicI32, AtomicI64};
 
+use atomic_traits::{Atomic, NumOps};
+use bytemuck::Zeroable;
 use clap::{Parser, Subcommand, ValueEnum};
 use clap_derive::Args;
 use itertools::Itertools;
-use medians::Medianf64;
+use medians::{Median, Medianf64};
+use num_traits::{FromPrimitive, NumCast};
 
 use experiments::*;
 use ticket::*;
@@ -29,9 +33,6 @@ enum Commands {
 
         #[arg(long)]
         table: bool,
-
-        #[arg(long)]
-        breakdown: bool,
     },
     Profile {
         #[arg(short, long, value_enum)]
@@ -39,6 +40,9 @@ enum Commands {
 
         #[command(flatten)]
         workload_args: WorkloadArgs,
+
+        #[arg(short, long, default_value_t = 0)]
+        delay: usize,
 
         #[arg(short, long, default_value = "/dev/null")]
         control: PathBuf,
@@ -59,17 +63,28 @@ struct WorkloadArgs {
     #[arg(long)]
     capacity: Option<usize>,
 
+    #[arg(long)]
+    #[clap(value_enum, default_value_t=ValueType::I64)]
+    value_type: ValueType,
+
+    #[arg(long)]
+    #[clap(value_enum, default_value_t=Operator::Sum)]
+    operator: Operator,
+
     #[arg(long, group = "distribution")]
     zipf: Option<f64>,
 
     #[arg(long, group = "distribution")]
     heavy_hitter: Option<f64>,
 
+    #[arg(long)]
+    no_zero: bool,
+
     #[arg(short, long, default_value_t = 5)]
     iterations: usize,
 }
 
-#[derive(ValueEnum, Debug, Clone)]
+#[derive(ValueEnum, Debug, Copy, Clone)]
 #[clap(rename_all = "kebab_case")]
 enum Workload {
     CuckooMap,
@@ -91,126 +106,229 @@ enum Workload {
     GlobalLockingE2E,
     ThreadLocalE2E,
 
-    AdHocResizingPartitionedE2E,
-    LinearProbingPartitionedE2E,
-    NoSpillPartitionedE2E,
-    PaginatedPartitionedE2E,
     PartitionedE2E,
 }
 
+#[derive(ValueEnum, Debug, Copy, Clone)]
+enum ValueType {
+    I16,
+    I32,
+    I64,
+}
+
+#[derive(ValueEnum, Debug, Copy, Clone)]
+enum Operator {
+    Count,
+    Max,
+    Sum,
+    Avg,
+}
+
 enum Breakdown {
-    Ticketing(()),
+    Ticketing((f64, f64, f64)),
     Update((f64, f64, f64)),
     E2EAggregation(Option<(f64, Vec<Vec<f64>>, Vec<Vec<f64>>, f64, f64)>),
-    E2EPartitionedAggregation(()),
+    E2EPartitionedAggregation((f64, f64, f64, f64)),
 }
 
 type DefaultTicketer = KeyedFolkloreTicketer<AtomicI64>;
 
-fn box_ticketing_workload<T: Ticketer<i64>>(threads: usize, keys: usize, capacity: Option<usize>)
-                                            -> Box<dyn Fn(&mut (Vec<i64>, Vec<i64>)) -> Breakdown> {
+fn box_ticketing_workload<T: Ticketer<i64>, V>(
+    threads: usize,
+    keys: usize,
+    capacity: Option<usize>,
+    zeroed: bool,
+) -> Box<dyn Fn(&mut (Vec<i64>, Vec<V>)) -> Breakdown> {
     Box::new(move |kv| {
-        Breakdown::Ticketing(ticketing_workload::<T>(threads, keys, &kv.0, &kv.1, capacity))
+        Breakdown::Ticketing(ticketing_workload::<T, V>(threads, keys, &kv.0, &kv.1, capacity, zeroed))
     })
 }
 
-fn box_update_workload<U: Updater<i64>>(threads: usize, keys: usize, capacity: Option<usize>)
-    -> Box<dyn Fn(&mut (Vec<i64>, Vec<i64>)) -> Breakdown> {
+fn box_update_workload<U: Updater<V>, V: Send + Sync>(
+    threads: usize,
+    keys: usize,
+    capacity: Option<usize>,
+    zeroed: bool,
+) -> Box<dyn Fn(&mut (Vec<i64>, Vec<V>)) -> Breakdown> {
     Box::new(move |kv| {
-        Breakdown::Update(update_workload::<U>(threads, keys, &kv.0, &kv.1, capacity))
+        Breakdown::Update(update_workload::<U, V>(threads, keys, &kv.0, &kv.1, capacity, zeroed))
     })
 }
 
-fn box_e2e_workload<T: KeyedTicketer<i64>, U: Updater<i64>>(threads: usize, keys: usize, capacity: Option<usize>, breakdown: bool)
-    -> Box<dyn Fn(&mut (Vec<i64>, Vec<i64>)) -> Breakdown>{
-    if breakdown {
-        Box::new(move |kv| {
-            Breakdown::E2EAggregation(end_to_end_workload::<T, U, true>(threads, keys, &kv.0, &kv.1, capacity))
-        })
-    } else {
-        Box::new(move |kv| {
-            Breakdown::E2EAggregation(end_to_end_workload::<T, U, false>(threads, keys, &kv.0, &kv.1, capacity))
-        })
-    }
-}
-
-fn box_e2e_partitioned_workload<A: PartitionedAggregator<i64, i64>>(threads: usize, keys: usize, capacity: Option<usize>)
-                                                                    -> Box<dyn Fn(&mut (Vec<i64>, Vec<i64>)) -> Breakdown> {
+fn box_e2e_workload<T: KeyedTicketer<i64>, U: Updater<V>, V: Send + Sync>(
+    threads: usize,
+    keys: usize,
+    capacity: Option<usize>,
+    zeroed: bool,
+) -> Box<dyn Fn(&mut (Vec<i64>, Vec<V>)) -> Breakdown>{
     Box::new(move |kv| {
-        Breakdown::E2EPartitionedAggregation(partitioned_end_to_end_workload::<A>(threads, keys, &kv.0, &kv.1, capacity))
+        Breakdown::E2EAggregation(end_to_end_workload::<T, U, V>(threads, keys, &kv.0, &kv.1, capacity, zeroed))
     })
 }
 
-fn box_workload_closure(workload: Workload, threads: usize, keys: usize, capacity: Option<usize>, breakdown: bool)
-                        -> Box<dyn Fn(&mut (Vec<i64>, Vec<i64>)) -> Breakdown> {
-    match workload.clone() {
-        Workload::CuckooMap
-        | Workload::DashMap
-        | Workload::FolkloreMap
-        | Workload::FolkloreUnfuzzyMap
-        | Workload::IcebergMap
-        | Workload::LeapMap
-        | Workload::GlobalLockingMap
-        | Workload::OnceLockMap => {
+fn box_e2e_partitioned_workload<A: PartitionedAggregator<i64, V>, V: Send + Sync>(
+    threads: usize,
+    keys: usize,
+    capacity: Option<usize>,
+    zeroed: bool,
+) -> Box<dyn Fn(&mut (Vec<i64>, Vec<V>)) -> Breakdown> {
+    Box::new(move |kv| {
+        Breakdown::E2EPartitionedAggregation(partitioned_end_to_end_workload::<A, V>(threads, keys, &kv.0, &kv.1, capacity, zeroed))
+    })
+}
+
+fn box_workload_closure<K: Send + Sync, V: Send + Sync + Atomic + NumOps + Zeroable>(
+    workload: Workload,
+    operator: Operator,
+    threads: usize,
+    keys: usize,
+    capacity: Option<usize>,
+    zeroed: bool,
+) -> Box<dyn Fn(&mut (Vec<i64>, Vec<<V as Atomic>::Type>)) -> Breakdown>
+where <V as Atomic>::Type: Send + Sync + PartialOrd + NumCast + AddAssign + Clone + Zeroable + Default + 'static,
+{
+    match (workload, operator) {
+        (Workload::CuckooMap, _)
+        | (Workload::DashMap, _)
+        | (Workload::FolkloreMap, _)
+        | (Workload::FolkloreUnfuzzyMap, _)
+        | (Workload::IcebergMap, _)
+        | (Workload::LeapMap, _)
+        | (Workload::GlobalLockingMap, _)
+        | (Workload::OnceLockMap, _) => {
             match workload {
-                Workload::CuckooMap => box_ticketing_workload::<CuckooTicketer<i64>>(threads, keys, capacity),
-                Workload::DashMap => box_ticketing_workload::<DashTicketer<i64>>(threads, keys, capacity),
-                Workload::FolkloreMap => box_ticketing_workload::<FolkloreTicketer<AtomicI64>>(threads, keys, capacity),
-                Workload::FolkloreUnfuzzyMap => box_ticketing_workload::<FolkloreUnfuzzyTicketer<AtomicI64>>(threads, keys, capacity),
-                Workload::IcebergMap => box_ticketing_workload::<IcebergTicketer<i64>>(threads, keys, capacity),
-                Workload::LeapMap => box_ticketing_workload::<LeapTicketer<i64>>(threads, keys, capacity),
-                Workload::GlobalLockingMap => box_ticketing_workload::<GlobalLockingTicketer<i64>>(threads, keys, capacity),
-                Workload::OnceLockMap => box_ticketing_workload::<OnceLockHashMap<i64>>(threads, keys, capacity),
-                _ => panic!("Error parsing workload: {:?}", workload),
+                Workload::CuckooMap => box_ticketing_workload::<CuckooTicketer<i64>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::DashMap => box_ticketing_workload::<DashTicketer<i64>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::FolkloreMap => box_ticketing_workload::<FolkloreTicketer<AtomicI64>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::FolkloreUnfuzzyMap => box_ticketing_workload::<FolkloreUnfuzzyTicketer<AtomicI64>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::IcebergMap => box_ticketing_workload::<IcebergTicketer<i64>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::LeapMap => box_ticketing_workload::<LeapTicketer<i64>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::GlobalLockingMap => box_ticketing_workload::<GlobalLockingTicketer<i64>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::OnceLockMap => box_ticketing_workload::<OnceLockHashMap<i64>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                _ => panic!("Unimplemented workload: {:?} {:?}", workload, operator),
             }
         },
-        Workload::AtomicPau
-        | Workload::LockingPau
-        | Workload::GlobalLockingPau
-        | Workload::ThreadLocalPau => {
+        (Workload::AtomicPau, Operator::Count)
+        | (Workload::LockingPau, Operator::Count)
+        | (Workload::GlobalLockingPau, Operator::Count)
+        | (Workload::ThreadLocalPau, Operator::Count) => {
             match workload {
-                Workload::AtomicPau => box_update_workload::<atomic_pau::CountUpdater<i64>>(threads, keys, capacity),
-                Workload::LockingPau => box_update_workload::<locking_agg::CountUpdater<i64>>(threads, keys, capacity),
-                Workload::GlobalLockingPau => box_update_workload::<global_locking_agg::CountUpdater<i64>>(threads, keys, capacity),
-                Workload::ThreadLocalPau => box_update_workload::<thread_local_agg::CountUpdater<i64>>(threads, keys, capacity),
-                _ => panic!("Error parsing workload: {:?}", workload),
+                Workload::AtomicPau => box_update_workload::<atomic_pau::CountUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::LockingPau => box_update_workload::<locking_pau::CountUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::GlobalLockingPau => box_update_workload::<global_locking_pau::CountUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::ThreadLocalPau => box_update_workload::<thread_local_pau::CountUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                _ => panic!("Unimplemented workload: {:?} {:?}", workload, operator),
             }
         },
-        Workload::AtomicE2E
-        | Workload::LockingE2E
-        | Workload::GlobalLockingE2E
-        | Workload::ThreadLocalE2E => {
+        (Workload::AtomicPau, Operator::Max)
+        | (Workload::LockingPau, Operator::Max)
+        | (Workload::GlobalLockingPau, Operator::Max)
+        | (Workload::ThreadLocalPau, Operator::Max) => {
             match workload {
-                Workload::AtomicE2E => box_e2e_workload::<DefaultTicketer, atomic_pau::CountUpdater<i64>>(threads, keys, capacity, breakdown),
-                Workload::LockingE2E => box_e2e_workload::<DefaultTicketer, locking_agg::CountUpdater<i64>>(threads, keys, capacity, breakdown),
-                Workload::GlobalLockingE2E => box_e2e_workload::<DefaultTicketer, global_locking_agg::CountUpdater<i64>>(threads, keys, capacity, breakdown),
-                Workload::ThreadLocalE2E => box_e2e_workload::<DefaultTicketer, thread_local_agg::CountUpdater<i64>>(threads, keys, capacity, breakdown),
-                _ => panic!("Error parsing workload: {:?}", workload),
+                Workload::AtomicPau => box_update_workload::<atomic_pau::MaxUpdater<V>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::LockingPau => box_update_workload::<locking_pau::MaxUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::GlobalLockingPau => box_update_workload::<global_locking_pau::MaxUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::ThreadLocalPau => box_update_workload::<thread_local_pau::MaxUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                _ => panic!("Unimplemented workload: {:?} {:?}", workload, operator),
             }
         },
-        Workload::AdHocResizingPartitionedE2E
-        | Workload::LinearProbingPartitionedE2E
-        | Workload::NoSpillPartitionedE2E
-        | Workload::PaginatedPartitionedE2E
-        | Workload::PartitionedE2E => {
+        (Workload::AtomicPau, Operator::Avg) => {
+            box_update_workload::<atomic_pau::AvgUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed)
+        },
+        (Workload::AtomicPau, Operator::Sum)
+        | (Workload::LockingPau, Operator::Sum)
+        | (Workload::GlobalLockingPau, Operator::Sum)
+        | (Workload::ThreadLocalPau, Operator::Sum) => {
             match workload {
-                Workload::AdHocResizingPartitionedE2E => box_e2e_partitioned_workload::<ad_hoc_resizing_basic_partitioned_agg::CountAgg<i64, i64>>(threads, keys, capacity),
-                Workload::LinearProbingPartitionedE2E => box_e2e_partitioned_workload::<linear_probing_partitioned_agg::CountAgg<i64, i64>>(threads, keys, capacity),
-                Workload::NoSpillPartitionedE2E => box_e2e_partitioned_workload::<no_spill_partitioned_agg::CountAgg<i64, i64>>(threads, keys, capacity),
-                Workload::PaginatedPartitionedE2E => box_e2e_partitioned_workload::<paginated_partitioned_agg::CountAgg<i64, i64>>(threads, keys, capacity),
-                Workload::PartitionedE2E => box_e2e_partitioned_workload::<basic_partitioned_agg::CountAgg<i64, i64>>(threads, keys, capacity),
-                _ => panic!("Error parsing workload: {:?}", workload),
+                Workload::AtomicPau => box_update_workload::<atomic_pau::SumUpdater<V>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::LockingPau => box_update_workload::<locking_pau::SumUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::GlobalLockingPau => box_update_workload::<global_locking_pau::SumUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::ThreadLocalPau => box_update_workload::<thread_local_pau::SumUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                _ => panic!("Unimplemented workload: {:?} {:?}", workload, operator),
             }
         },
+        (Workload::AtomicE2E, Operator::Count)
+        | (Workload::LockingE2E, Operator::Count)
+        | (Workload::GlobalLockingE2E, Operator::Count)
+        | (Workload::ThreadLocalE2E, Operator::Count) => {
+            match workload {
+                Workload::AtomicE2E => box_e2e_workload::<DefaultTicketer, atomic_pau::CountUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::LockingE2E => box_e2e_workload::<DefaultTicketer, locking_pau::CountUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::GlobalLockingE2E => box_e2e_workload::<DefaultTicketer, global_locking_pau::CountUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::ThreadLocalE2E => box_e2e_workload::<DefaultTicketer, thread_local_pau::CountUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                _ => panic!("Unimplemented workload: {:?} {:?}", workload, operator),
+            }
+        },
+        (Workload::AtomicE2E, Operator::Max)
+        | (Workload::LockingE2E, Operator::Max)
+        | (Workload::GlobalLockingE2E, Operator::Max)
+        | (Workload::ThreadLocalE2E, Operator::Max) => {
+            match workload {
+                Workload::AtomicE2E => box_e2e_workload::<DefaultTicketer, atomic_pau::MaxUpdater<V>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::LockingE2E => box_e2e_workload::<DefaultTicketer, locking_pau::MaxUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::GlobalLockingE2E => box_e2e_workload::<DefaultTicketer, global_locking_pau::MaxUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::ThreadLocalE2E => box_e2e_workload::<DefaultTicketer, thread_local_pau::MaxUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                _ => panic!("Unimplemented workload: {:?} {:?}", workload, operator),
+            }
+        },
+        (Workload::AtomicE2E, Operator::Sum)
+        | (Workload::LockingE2E, Operator::Sum)
+        | (Workload::GlobalLockingE2E, Operator::Sum)
+        | (Workload::ThreadLocalE2E, Operator::Sum) => {
+            match workload {
+                Workload::AtomicE2E => box_e2e_workload::<DefaultTicketer, atomic_pau::SumUpdater<V>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::LockingE2E => box_e2e_workload::<DefaultTicketer, locking_pau::SumUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::GlobalLockingE2E => box_e2e_workload::<DefaultTicketer, global_locking_pau::SumUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Workload::ThreadLocalE2E => box_e2e_workload::<DefaultTicketer, thread_local_pau::SumUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                _ => panic!("Unimplemented workload: {:?} {:?}", workload, operator),
+            }
+        },
+        (Workload::AtomicE2E, Operator::Avg) => {
+            box_e2e_workload::<DefaultTicketer, atomic_pau::AvgUpdater<<V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed)
+        },
+        (Workload::PartitionedE2E, _) => {
+            match operator {
+                Operator::Count => box_e2e_partitioned_workload::<basic_partitioned_agg::SumAgg<i64, <V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Operator::Max => box_e2e_partitioned_workload::<basic_partitioned_agg::SumAgg<i64, <V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                Operator::Sum => box_e2e_partitioned_workload::<basic_partitioned_agg::SumAgg<i64, <V as Atomic>::Type>, <V as Atomic>::Type>(threads, keys, capacity, zeroed),
+                _ => panic!("Unimplemented workload: {:?} {:?}", workload, operator),
+            }
+        },
+        _ => panic!("Unimplemented workload: {:?}", workload),
     }
 }
 
-fn process_breakdown(breakdown: Vec<Breakdown>, enabled: bool) -> Option<(f64, f64, f64, f64)> {
-    if !enabled {
-        return None;
-    }
-
+fn process_breakdown(breakdown: Vec<Breakdown>) -> (f64, f64, f64, f64) {
     match breakdown[0] {
+        Breakdown::Ticketing(_) => {
+            let res = breakdown.into_iter()
+                .map(|b| {
+                    if let Breakdown::Ticketing(b_unwrapped) = b {
+                        b_unwrapped
+                    } else {
+                        panic!("Inconsistent breakdown types");
+                    }
+                })
+                .collect_vec();
+
+            let mut init_times = Vec::new();
+            let mut ticketing_times = Vec::new();
+            let mut mat_times = Vec::new();
+
+            res.into_iter()
+                .for_each(|(initialization, ticketing, materialization)| {
+                    init_times.push(initialization);
+                    ticketing_times.push(ticketing);
+                    mat_times.push(materialization);
+                });
+
+            (
+                init_times.as_mut_slice().medf_unchecked(),
+                ticketing_times.as_mut_slice().medf_unchecked(),
+                0f64,
+                mat_times.as_mut_slice().medf_unchecked(),
+            )
+        },
         Breakdown::Update(_) => {
             let res = breakdown.into_iter()
                 .map(|b| {
@@ -222,23 +340,23 @@ fn process_breakdown(breakdown: Vec<Breakdown>, enabled: bool) -> Option<(f64, f
                 })
                 .collect_vec();
 
-            let mut initalization_times = Vec::new();
-            let mut aggregation_times = Vec::new();
-            let mut materialization_times = Vec::new();
+            let mut init_times = Vec::new();
+            let mut pau_times = Vec::new();
+            let mut mat_times = Vec::new();
 
             res.into_iter()
-                .for_each(|(initalization, aggregation, materialization)| {
-                    initalization_times.push(initalization);
-                    aggregation_times.push(aggregation);
-                    materialization_times.push(materialization);
+                .for_each(|(initialization, aggregation, materialization)| {
+                    init_times.push(initialization);
+                    pau_times.push(aggregation);
+                    mat_times.push(materialization);
                 });
 
-            Some((
-                initalization_times.as_mut_slice().medf_unchecked(),
+            (
+                init_times.as_mut_slice().medf_unchecked(),
                 0f64,
-                aggregation_times.as_mut_slice().medf_unchecked(),
-                materialization_times.as_mut_slice().medf_unchecked(),
-            ))
+                pau_times.as_mut_slice().medf_unchecked(),
+                mat_times.as_mut_slice().medf_unchecked(),
+            )
         },
         Breakdown::E2EAggregation(_) => {
             let res = breakdown.into_iter()
@@ -251,10 +369,10 @@ fn process_breakdown(breakdown: Vec<Breakdown>, enabled: bool) -> Option<(f64, f
                 })
                 .collect_vec();
 
-            let mut initalization_times = Vec::new();
+            let mut init_times = Vec::new();
             let mut ticketing_times = Vec::new();
-            let mut aggregation_times = Vec::new();
-            let mut materialization_times = Vec::new();
+            let mut pau_times = Vec::new();
+            let mut mat_times = Vec::new();
 
             res.into_iter()
                 .map(|trial| trial.unwrap())
@@ -264,20 +382,50 @@ fn process_breakdown(breakdown: Vec<Breakdown>, enabled: bool) -> Option<(f64, f
                     (init, (s1 / (s1 + s2)) * s12, (s2 / (s1 + s2)) * s12, mat)
                 })
                 .for_each(|(initialization, ticketing, aggregation, materialization)| {
-                    initalization_times.push(initialization);
+                    init_times.push(initialization);
                     ticketing_times.push(ticketing);
-                    aggregation_times.push(aggregation);
-                    materialization_times.push(materialization);
+                    pau_times.push(aggregation);
+                    mat_times.push(materialization);
                 });
 
-            Some((
-                initalization_times.as_mut_slice().medf_unchecked(),
+            (
+                init_times.as_mut_slice().medf_unchecked(),
                 ticketing_times.as_mut_slice().medf_unchecked(),
-                aggregation_times.as_mut_slice().medf_unchecked(),
-                materialization_times.as_mut_slice().medf_unchecked(),
-            ))
+                pau_times.as_mut_slice().medf_unchecked(),
+                mat_times.as_mut_slice().medf_unchecked(),
+            )
         },
-        _ => None,
+        Breakdown::E2EPartitionedAggregation(_) => {
+            let res = breakdown.into_iter()
+                .map(|b| {
+                    if let Breakdown::E2EPartitionedAggregation(b_unwrapped) = b {
+                        b_unwrapped
+                    } else {
+                        panic!("Inconsistent breakdown types");
+                    }
+                })
+                .collect_vec();
+
+            let mut init_times = Vec::new();
+            let mut pre_times = Vec::new();
+            let mut local_times = Vec::new();
+            let mut mat_times = Vec::new();
+
+            res.into_iter()
+                .for_each(|(initialization, pre, local, materialization)| {
+                    init_times.push(initialization);
+                    pre_times.push(pre);
+                    local_times.push(local);
+                    mat_times.push(materialization);
+                });
+
+            (
+                init_times.as_mut_slice().medf_unchecked(),
+                pre_times.as_mut_slice().medf_unchecked(),
+                local_times.as_mut_slice().medf_unchecked(),
+                mat_times.as_mut_slice().medf_unchecked(),
+            )
+        },
     }
 }
 
@@ -285,33 +433,34 @@ fn main() {
     let args = Args::parse();
 
     match args.command {
-        Commands::Bench { workload, workload_args, table, breakdown } => {
-            let WorkloadArgs { threads, elements, keys, capacity, zipf, heavy_hitter, iterations } = workload_args;
-            let mut kvs = generate_dataset(elements, keys, zipf, heavy_hitter);
+        Commands::Bench { workload, workload_args, table } => {
+            let WorkloadArgs { threads, elements, keys, capacity, value_type, operator, zipf, heavy_hitter, no_zero, iterations } = workload_args;
 
-            for w in workload {
-                let workload_closure = box_workload_closure(w.clone(), threads, keys, capacity, breakdown);
-                let (results_base, mut mems, breakdown_results) = benchmark_harness(&mut kvs, workload_closure, iterations);
-                let results_wl: Option<(f64, f64, f64, f64)> = process_breakdown(breakdown_results, breakdown);
+            let print_results = |results: (Vec<f64>, Vec<usize>, Vec<Breakdown>), w: Workload| {
+                let results_base = results.0;
+                let mut mems = results.1;
+                let breakdown_results = results.2;
+                let results_wl: (f64, f64, f64, f64) = process_breakdown(breakdown_results);
 
                 if table {
                     print!(
-                        "{:?},{},{},{},{},{},{},{:+e}",
+                        "{:?},{},{},{},{},{:?},{:?},{:?},{},{},{:+e}",
                         w,
                         threads,
                         keys,
                         elements,
                         capacity.unwrap_or(keys),
+                        !no_zero,
+                        value_type,
+                        operator,
                         zipf.unwrap_or(0.0),
                         heavy_hitter.unwrap_or(0.0),
-                        mems.as_mut_slice().medf_unchecked(),
+                        mems.as_mut_slice().uqmedian(|v| u64::from_usize(*v).unwrap()).unwrap(),
                     );
                     for trial in results_base {
                         print!(",{:?}", trial);
                     }
-                    if let Some(results_wl) = results_wl {
-                        print!(",{:+e},{:+e},{:+e},{:+e}", results_wl.0, results_wl.1, results_wl.2, results_wl.3);
-                    }
+                    print!(",{:+e},{:+e},{:+e},{:+e}", results_wl.0, results_wl.1, results_wl.2, results_wl.3);
                     println!();
                 } else {
                     println!("Workload: {:?}", w);
@@ -319,28 +468,76 @@ fn main() {
                     println!("Keys: {}", keys);
                     println!("Elements: {}", elements);
                     println!("Capacity: {}", capacity.unwrap_or(keys));
+                    println!("Zeroed: {}", !no_zero);
+                    println!("Value Type: {:?}", value_type);
+                    println!("Operator: {:?}", operator);
                     println!("Zipf: {}", zipf.unwrap_or(0.0));
                     println!("Heavy Hitter: {}", heavy_hitter.unwrap_or(0.0));
-                    println!("Memory: {:+e}", mems.as_mut_slice().medf_unchecked());
+                    println!("Memory: {:+e}", mems.as_mut_slice().uqmedian(|v| u64::from_usize(*v).unwrap()).unwrap());
                     println!("Trials: {:?}", results_base);
-                    if let Some(results_wl) = results_wl {
-                        println!("Initialization: {:+e}", results_wl.0);
-                        println!("Stage 1: {:+e}", results_wl.1);
-                        println!("Stage 2: {:+e}", results_wl.2);
-                        println!("Materialization: {:+e}", results_wl.3);
+                    println!("Initialization: {:+e}", results_wl.0);
+                    println!("Stage 1: {:+e}", results_wl.1);
+                    println!("Stage 2: {:+e}", results_wl.2);
+                    println!("Materialization: {:+e}", results_wl.3);
+                }
+            };
+
+            match value_type {
+                ValueType::I16 => {
+                    let mut kvs = generate_dataset::<i64, i16>(elements, keys, zipf, heavy_hitter);
+                    for &w in workload.iter() {
+                        let workload_closure = box_workload_closure::<i64, AtomicI16>(w, operator, threads, keys, capacity, !no_zero);
+                        print_results(benchmark_harness(&mut kvs, workload_closure, iterations), w);
+                    }
+                }
+                ValueType::I32 => {
+                    let mut kvs = generate_dataset::<i64, i32>(elements, keys, zipf, heavy_hitter);
+                    for &w in workload.iter() {
+                        let workload_closure = box_workload_closure::<i64, AtomicI32>(w, operator, threads, keys, capacity, !no_zero);
+                        print_results(benchmark_harness(&mut kvs, workload_closure, iterations), w);
+                    }
+                }
+                ValueType::I64 => {
+                    let mut kvs = generate_dataset::<i64, i64>(elements, keys, zipf, heavy_hitter);
+                    for &w in workload.iter() {
+                        let workload_closure = box_workload_closure::<i64, AtomicI64>(w, operator, threads, keys, capacity, !no_zero);
+                        print_results(benchmark_harness(&mut kvs, workload_closure, iterations), w);
                     }
                 }
             }
         },
-        Commands::Profile { workload, workload_args, control } => {
-            let WorkloadArgs { threads, elements, keys, capacity, zipf, heavy_hitter, iterations } = workload_args;
-            let setup_closure = || {
-                let (keys, values) = generate_dataset(elements, keys, zipf, heavy_hitter);
-                (keys, values)
-            };
+        Commands::Profile { workload, workload_args, delay, control } => {
+            let WorkloadArgs { threads, elements, keys, capacity, value_type, operator, zipf, heavy_hitter, no_zero, iterations } = workload_args;
 
-            let workload_closure = box_workload_closure(workload, threads, keys, capacity, false);
-            profile_harness(control.to_str().unwrap(), setup_closure, workload_closure, iterations);
+            let elapsed;
+            match value_type {
+                ValueType::I16 => {
+                    let setup_closure = || {
+                        let (keys, values) = generate_dataset::<i64, i16>(elements, keys, zipf, heavy_hitter);
+                        (keys, values)
+                    };
+                    let workload_closure = box_workload_closure::<i64, AtomicI16>(workload, operator, threads, keys, capacity, !no_zero);
+                    elapsed = profile_harness(delay, control.to_str().unwrap(), setup_closure, workload_closure, iterations);
+                }
+                ValueType::I32 => {
+                    let setup_closure = || {
+                        let (keys, values) = generate_dataset::<i64, i32>(elements, keys, zipf, heavy_hitter);
+                        (keys, values)
+                    };
+                    let workload_closure = box_workload_closure::<i64, AtomicI32>(workload, operator, threads, keys, capacity, !no_zero);
+                    elapsed = profile_harness(delay, control.to_str().unwrap(), setup_closure, workload_closure, iterations);
+                }
+                ValueType::I64 => {
+                    let setup_closure = || {
+                        let (keys, values) = generate_dataset::<i64, i64>(elements, keys, zipf, heavy_hitter);
+                        (keys, values)
+                    };
+                    let workload_closure = box_workload_closure::<i64, AtomicI64>(workload, operator, threads, keys, capacity, !no_zero);
+                    elapsed = profile_harness(delay, control.to_str().unwrap(), setup_closure, workload_closure, iterations);
+                }
+            }
+
+            println!("Elapsed time: {:+e}", elapsed);
         },
     }
 }

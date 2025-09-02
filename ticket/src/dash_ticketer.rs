@@ -7,7 +7,6 @@ use itertools::Itertools;
 use common::FuzzyCounter;
 use crate::ticketer::Ticketer;
 
-
 #[derive(Default)]
 pub struct DashTicketer<K: Eq + Hash, S: BuildHasher + Clone = FnvBuildHasher> {
     map: DashMap<K, usize, S>,

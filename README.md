@@ -8,7 +8,7 @@ This repository contains various interchangeable implementations for our two des
 - `common/`: code used throughout the project providing some sort of primitive logic.
 - `experiments/`: code, scripts, data, and notebook to reproduce our experiment results.
 - `partial-aggregate-update/`: a module implementing the second stage of our fully concurrent aggregation method, partial aggregate update.
-- `partitioned-aggregate/`: a module implementing methods of partitioned group aggregations.
+- `partitioned-aggregate/`: a module implementing partitioned group aggregations.
 - `ticket/`: a module implementing the first stage of our fully concurrent aggregation method, ticketing. 
 
 ## Usage
@@ -22,12 +22,14 @@ bench
     -t, --threads <THREADS>
     -e, --elements <ELEMENTS>
     -k, --keys <KEYS>
-        --capacity <CAPACITY>          [optional, overwrite default capacity (the number of keys)]
+        --capacity <CAPACITY>          [optional, overwrites default capacity (the number of keys)]
+        --value-type <VALUE_TYPE>      [default: i64] [possible values: i16, i32, i64]
+        --operator <OPERATOR>          [default: sum] [possible values: count, max, sum, avg]
         --zipf <ZIPF>                  [optional, zipfian exponential parameter]
         --heavy-hitter <HEAVY_HITTER>  [optional, proportion of values to make the heavy hitter value]
+        --no-zero                      [disables default optimization to zero-allocate large data structures]
     -i, --iterations <ITERATIONS>      [default: 5]
         --table                        [return as comma separated values]
-        --breakdown                    [for partial aggregate update and fully concurrent end-to-end workloads, show how much time is spent on each stage.
 ```
 
 For example, to benchmark the end-to-end performance of thread local aggregation with 1000 keys and 100 million elements with 32 threads, you could run the command `RUSTFLAGS="-C target-cpu=native" cargo run --release -- bench -w thread-local-e2e -t 32 -k 1000 -e 100000000`. Note that you can run multiple workloads in one go with repeated workload arguments. 
@@ -40,10 +42,14 @@ profile
     -t, --threads <THREADS>
     -e, --elements <ELEMENTS>
     -k, --keys <KEYS>
-        --capacity <CAPACITY>          [optional, overwrite default capacity (the number of keys)]
+        --capacity <CAPACITY>          [optional, overwrites default capacity (the number of keys)]
+        --value-type <VALUE_TYPE>      [default: i64] [possible values: i16, i32, i64]
+        --operator <OPERATOR>          [default: sum] [possible values: count, max, sum, avg]
         --zipf <ZIPF>                  [optional, zipfian exponential parameter]
         --heavy-hitter <HEAVY_HITTER>  [optional, proportion of values to make the heavy hitter value]
+        --no-zero                      [disables default optimization to zero-allocate large data structures]
     -i, --iterations <ITERATIONS>      [default: 5]
+    -d, --delay <DELAY>                [default: 0]
     -c, --control <CONTROL>            [default: /dev/null]
 ```
 
@@ -51,18 +57,23 @@ For example, you could use this command with `perf` to measure performance count
 
 ### Workloads
 The accepted workloads are as followed (note not all are shown in the paper):
-- Ticketing: `cuckoo-map`, `dash-map`, `folklore-map`, `folklore-unfuzzy-map` (for fuzzy ticketing experiment only), `iceberg-map`, `leap-map`, `global-locking-map`, `once-lock-map`,
-- Partial aggregate update: `atomic-pau`, `locking-pau`, `global-locking-pau`, `thread-local-pau`
-- End-to-end fully concurrent aggregation:  `atomic-e2e`, `locking-e2e`, `global-locking-e2e`, `thread-local-e2e`
-- End-to-end partitioned aggregation: `ad-hoc-resizing-partitioned-e2e` (for resizing experiment only), `linear-probing-partitioned-e2e`, `no-spill-partitioned-e2e`, `paginated-partitioned-e2e`, `partitioned-e2e`
+- Ticketing: `cuckoo-map`, `dash-map`, `folklore-map`, `folklore-unfuzzy-map` (for fuzzy ticketing experiment only), `iceberg-map`, `leap-map`, `global-locking-map`, `once-lock-map`.
+- Partial aggregate update: `atomic-pau`, `locking-pau`, `global-locking-pau`, `thread-local-pau`.
+- End-to-end fully concurrent aggregation:  `atomic-e2e`, `locking-e2e`, `global-locking-e2e`, `thread-local-e2e`.
+- End-to-end partitioned aggregation: `partitioned-e2e`.
 
 ## Experiments
 ### Data
-Data from our experiments used to generate the graphs in our paper are provided in `experiments/data/`. Note that the main scaling experiment was run prior to us adding memory profiling capabilities, so it lacks that column of data. All experiments were run on a machine with 256 GB of RAM and an AMD EPYC 9454P processor with 48 cores @ 2.75GHz.
+Data from our experiments used to generate the graphs in our paper are provided in `experiments/data/`. We performed benchmarks on the following systems:
+- AMD (primary system, data files not post-fixed): AMD EPYC 9454P processor with 48 cores @2.75GHz and 256 GB of RAM.
+- ARM (data files post-fixed with `arm`): Ampere Altra Q80-30 processor with 80 cores @3.0GHz and 256 GB of RAM.
+- Intel (data files post-fixed with `intel`): Intel Xeon Gold 5412U processor with 24 cores @2.10GHz and 256 GB of RAM.
 
 ### Reproduction
-You can directly run the provided scripts in `experiments/scripts/`. All scripts take a power-of-two max thread count as an argument. There are four experiments:
-- `scaling_experiment.sh`: the main experiment that measures the performance and behavior of our aggregation methods, used to generate Figures 4-7 and Table 2.
-- `fuzzy_ticketing_experiment.sh`: to test the impact of the fuzzy ticketer in Figure 3
-- `resizing_experiment.sh`: to test the impact of imprecise cardinality estimation in Figure 8.
-- `memory_experiment.sh`: to assess peak memory usage in Table 3. With our later changes to the benchmarking harness the same data can be derived from the result of `scaling_experiment.sh`, but since our uploaded data lacks memory data we keep this script for completeness. 
+You can directly run the provided scripts in `experiments/scripts/` to reproduce the experimental results. All scripts take a list of thread counts as input. The experiments are as follows:
+- `scaling_experiment.sh`: the main experiment that measures the performance and behavior of our aggregation methods.
+- `stat_experiment.sh`: measures performance counters using `perf stat` on the same workloads as the scaling experiment.
+- `fuzzy_ticketing_experiment.sh`: to test the impact of the fuzzy ticketer on performance.
+- `resizing_experiment.sh`: to test the impact of imprecise cardinality estimation on performance.
+- `tuple_size_experiment.sh`: to test the impact of tuple size on performance.
+- `zeroed_experiment.sh`: to test the impact zero-allocation on performance.

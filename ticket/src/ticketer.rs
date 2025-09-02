@@ -3,6 +3,10 @@ use common::FuzzyCounterFinalizer;
 pub trait Ticketer<K>: Sync + Send {
     fn with_capacity_and_threads(capacity: usize, threads: usize) -> Self;
 
+    fn with_capacity_and_threads_zeroed(capacity: usize, threads: usize) -> Self where Self: Sized {
+        Self::with_capacity_and_threads(capacity, threads)
+    }
+
     /// Lookup or insert a new ticket for each key.  Results will be written into
     /// `output`, which must be at least as large as `keys`.
     fn ticket(&self, keys: &[K], output: &mut [usize]);

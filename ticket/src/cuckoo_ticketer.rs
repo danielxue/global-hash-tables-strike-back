@@ -1,3 +1,4 @@
+#![allow(dead_code)] // For some weird linting with Zeroable derive.
 #![allow(clippy::needless_return)]
 
 //! A concurrent bucketized-cuckoo hash map which supports a "write" phase
@@ -10,20 +11,19 @@
 //! 2) Evictions do not require taking a global lock (all buckets on the
 //!    potential eviction path must be locked, however)
 use std::{
-    arch::x86_64::{_MM_HINT_T0, _mm_prefetch},
     borrow::Borrow,
     collections::{HashMap, HashSet, VecDeque},
     hash::{BuildHasher, Hash, Hasher},
 };
-use std::cell::RefMut;
+use bytemuck::Zeroable;
 use fnv::FnvBuildHasher;
 use itertools::Itertools;
 
-use common::{FuzzyCounter, LockVec};
+use common::{FuzzyCounter, LocalCounter, LockVec};
 use crate::ticketer::Ticketer;
 
-#[derive(Clone, Default)]
-pub struct CuckooBucket<K> {
+#[derive(Clone, Default, Zeroable)]
+struct CuckooBucket<K: Zeroable> {
     used_bitmap: u8,
     keys: [K; 8],
     values: [usize; 8],
@@ -31,7 +31,7 @@ pub struct CuckooBucket<K> {
 
 /// A bucket containing a fixed number of slots for items. Each slot holds
 /// one item.
-impl<K: PartialEq + Default> CuckooBucket<K> {
+impl<K: PartialEq + Default + Zeroable> CuckooBucket<K> {
     fn is_slot_empty(&self, idx: usize) -> bool {
         (self.used_bitmap & (1 << idx)) == 0
     }
@@ -184,16 +184,16 @@ fn hash_keys<H: BuildHasher, K: Hash + ?Sized>(
 
     // return the hashes with the smaller value first, so we always
     // take locks in order
-    if b1 < b2 {
-        return (b1, b2);
+    return if b1 < b2 {
+        (b1, b2)
     } else {
-        return (b2, b1);
+        (b2, b1)
     }
 }
 
 pub type InsertResult = Result<usize, ()>;
 
-pub struct CuckooTicketer<K: Default, S = FnvBuildHasher> {
+pub struct CuckooTicketer<K: Zeroable + Default, S = FnvBuildHasher> {
     buckets: LockVec<CuckooBucket<K>>,
     ticketer: FuzzyCounter,
     h: S,
@@ -201,7 +201,7 @@ pub struct CuckooTicketer<K: Default, S = FnvBuildHasher> {
 
 impl<K: Default + Clone, S> CuckooTicketer<K, S>
 where
-    K: Hash + PartialEq,
+    K: Hash + PartialEq + Zeroable,
     S: Default + BuildHasher,
 {
     const LF: f64 = 0.5; // Set a bit lower to decrease chance of eviction.
@@ -219,10 +219,18 @@ where
     }
 
     /// Constructs a new CuckooHashMap with the given number of buckets.
-    /// Capacity is approximately 80% of (`num_buckets` * 8) =
-    /// `num_buckets` * 6.4.
     pub fn with_buckets(num_buckets: usize) -> CuckooTicketer<K, S> {
         let buckets = LockVec::new(num_buckets);
+        return CuckooTicketer {
+            buckets,
+            ticketer: FuzzyCounter::new(0),
+            h: Default::default(),
+        };
+    }
+
+    /// Constructs a new CuckooHashMap with the given number of buckets using zero-allocation.
+    pub fn with_buckets_zeroed(num_buckets: usize) -> CuckooTicketer<K, S> {
+        let buckets = LockVec::new_zeroed(num_buckets);
         return CuckooTicketer {
             buckets,
             ticketer: FuzzyCounter::new(0),
@@ -241,19 +249,19 @@ where
 
     /// Insert a new value into the hash table. If the key was not previously present,
     ///  a key is inserted with the given value. If the key existed, then nothing occurs.
-    pub fn insert(&self, key: K, counter: &mut RefMut<(usize, usize)>) -> InsertResult {
+    pub fn insert(&self, key: K, counter: &mut LocalCounter) -> InsertResult {
         let (k, b1_idx, b2_idx) = {
             let (b1_idx, b2_idx) = self.hash_keys(&key, self.buckets.len());
 
             // fast path for lookup.
             {
-                let b1 = self.buckets.read(b1_idx).unwrap();
+                let b1 = self.buckets.read(b1_idx)?;
                 match b1.search(&key) {
                     Some(value) => {
                         return Ok(value);
                     }
                     None => {
-                        let b2 = self.buckets.read(b2_idx).unwrap();
+                        let b2 = self.buckets.read(b2_idx)?;
                         match b2.search(&key) {
                             Some(value) => {
                                 return Ok(value);
@@ -266,13 +274,13 @@ where
 
             // acquire write lock for one bucket at a time which improves
             // performance for update-heavy workloads
-            let mut b1 = self.buckets.write(b1_idx).unwrap();
+            let mut b1 = self.buckets.write(b1_idx)?;
             match b1.search(&key) {
                 Some(value) => {
                     return Ok(value);
                 }
                 None => {
-                    let mut b2 = self.buckets.write(b2_idx).unwrap();
+                    let mut b2 = self.buckets.write(b2_idx)?;
                     match b2.search(&key) {
                         Some(value) => {
                             return Ok(value);
@@ -313,7 +321,7 @@ where
     /// old items inserted into the resized table), `None` is returned. If
     /// some items could not fit, the non-fitting items are returned.
     pub fn resize_table(&mut self, new_size: usize) -> Option<Vec<(K, usize)>> {
-        let mut new_buckets = LockVec::new(new_size);
+        let mut new_buckets = LockVec::new_zeroed(new_size);
         std::mem::swap(&mut self.buckets, &mut new_buckets);
         let old_buckets = new_buckets;
 
@@ -342,10 +350,10 @@ where
             }
         }
 
-        if did_not_fit.is_empty() {
-            return None;
+        return if did_not_fit.is_empty() {
+            None
         } else {
-            return Some(did_not_fit);
+            Some(did_not_fit)
         }
     }
 
@@ -369,12 +377,6 @@ where
         // next, verify that the path is valid
         for ((src_b_id, src_s_id), (dst_b_id, _dst_s_id)) in plan.iter().tuple_windows() {
             let src_b = &bucket_locks[src_b_id];
-
-            // prefetch the destination bucket
-            unsafe {
-                let ptr: *const CuckooBucket<K> = &*bucket_locks[dst_b_id];
-                _mm_prefetch::<_MM_HINT_T0>(ptr as *const i8);
-            }
 
             match src_b.at(*src_s_id) {
                 None => return false,
@@ -488,11 +490,15 @@ where
 }
 
 impl<
-    K: Send + Sync + Default + Eq + Hash + Clone,
+    K: Send + Sync + Default + Eq + Hash + Clone + Zeroable,
     S: BuildHasher + Send + Sync + Default,
 > Ticketer<K> for CuckooTicketer<K, S> {
     fn with_capacity_and_threads(capacity: usize, _threads: usize) -> Self {
         return CuckooTicketer::with_buckets((capacity.div_ceil(8) as f64 / Self::LF).ceil() as usize);
+    }
+
+    fn with_capacity_and_threads_zeroed(capacity: usize, _threads: usize) -> Self {
+        return CuckooTicketer::with_buckets_zeroed((capacity.div_ceil(8) as f64 / Self::LF).ceil() as usize);
     }
 
     fn ticket(&self, keys: &[K], output: &mut [usize]) {

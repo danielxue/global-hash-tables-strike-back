@@ -26,8 +26,9 @@ impl<K: Eq + Hash + Default + Copy + Sync + Send + Debug, S: BuildHasher + Clone
 
         for (key, out) in keys.iter().zip(output.iter_mut()) {
             if let Some(mut kv) = self.map.get(&key) {
-                *out = kv.value().unwrap(); // Can unwrap because impossible cell was deleted.
+                *out = kv.value().unwrap(); // Can unwrap because no deletions -> no None returns.
                 continue;
+
             }
 
             match self.map.try_insert(*key, self.ticketer.fetch(&mut counter)) {
